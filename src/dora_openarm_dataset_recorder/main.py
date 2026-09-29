@@ -251,134 +251,121 @@ class DatasetWriter:
         return existing_metadata
 
 
-def data_path(input_name):
-    """Return the dataset path a recorder input is stored under.
+class FrequencyDetector:
+    """Detect the nominal frequency of an input from the dataflow.
 
-    ``arm_right_action`` -> ``action/arms/right``,
-    ``elevation_observation`` -> ``obs/lifter/elevation``,
-    ``camera_head_left`` -> ``cameras/head_left``.
-    Returns ``None`` for inputs that are not recorded as data.
+    A node states its rate in one of two ways: it takes a timer, directly or
+    through a quitter, on an input named ``tick``, ``request_state`` or
+    ``request_position``; or, when it is event-driven and takes no tick at all,
+    it declares ``--tick-hz`` in its arguments (the IK node documents that
+    argument as its nominal rate). A node that states neither is walked no
+    further: wire a tick to it in the dataflow rather than guessing here.
+
+    The frequency is the rate the dataflow asks for, not the rate the data
+    arrived at; what a camera actually delivered is in its image timestamps.
     """
-    if input_name.startswith("arm_"):
-        side, type = input_name.split("_")[1:3]
-        return f"{TYPE_PATHS[type]}/arms/{side}"
-    elif input_name.startswith("elevation_"):
-        type = input_name.removeprefix("elevation_")
-        return f"{TYPE_PATHS[type]}/lifter/elevation"
-    elif input_name.startswith("camera_"):
-        return f"cameras/{input_name.removeprefix('camera_')}"
-    return None
 
+    _RATE_INPUTS = ("tick", "request_state", "request_position")
 
-TYPE_PATHS = {"action": "action", "observation": "obs"}
+    def __init__(self, configs):
+        """Initialize with node configurations."""
+        self._configs = {config["id"]: config for config in configs}
 
-# The rates the cell runs at: the arms and the lifter follow the leader tick,
-# the cameras follow the camera tick. These are nominal rates, i.e. what the
-# dataflow asks for -- what a camera actually delivered is in its image
-# timestamps, and measuring that is left to the dataset tools.
-#
-# They are declared rather than derived from the dataflow. Walking the graph
-# upstream to find the timer behind each stream reconstructs, unreliably, a
-# fact that fits on one line: it broke on every node whose input names it did
-# not know (splitters, IK), and it turned 33 ms into 30.303030303030305.
-DEFAULT_FREQUENCIES = {"arms": 250.0, "lifter": 250.0, "cameras": 30.0}
+    def detect(self, input):
+        """Detect frequency of the given input, or ``None`` if it has no rate."""
+        node_id = self._source(input).split("/", 1)[0]
+        config = self._configs.get(node_id)
+        if config is None:
+            return None
+        inputs = config.get("inputs") or {}
+        for name in self._RATE_INPUTS:
+            if name in inputs:
+                next_input = self._source(inputs[name])
+                if next_input.startswith("dora/timer/"):
+                    return self._timer_frequency(next_input)
+                return self.detect(next_input)
+        return self._declared_frequency(config)
 
+    def _declared_frequency(self, config):
+        args = (config.get("args") or "").split()
+        if "--tick-hz" not in args:
+            return None
+        value = args[args.index("--tick-hz") + 1]
+        return float(value)
 
-def frequency_group(path):
-    """Return the group of a data path: ``arms``, ``lifter`` or ``cameras``."""
-    if path.startswith("cameras/"):
-        return "cameras"
-    return path.split("/")[1]
+    def _source(self, input):
+        # An input is either "node/output" or {source: ..., queue_size: ...}.
+        if isinstance(input, dict):
+            return input["source"]
+        return input
 
-
-def _known_frequency_key(key):
-    if key in DEFAULT_FREQUENCIES:
-        return True
-    return "/" in key and frequency_group(key) in DEFAULT_FREQUENCIES
+    def _timer_frequency(self, timer):
+        unit, value = timer.split("/")[2:4]
+        if unit == "secs":
+            return 1.0 / int(value)
+        elif unit == "millis":
+            return 1_000.0 / int(value)
+        return None
 
 
 def parse_frequencies(raw):
-    """Parse the ``FREQUENCIES`` setting into ``{group or data path: Hz}``.
+    """Parse the ``FREQUENCIES`` setting: a YAML map of input name to Hz.
 
-    A group covers every stream in it (``arms: 500``), a data path covers one
-    stream (``cameras/ceiling: 15``).
+    For streams whose rate the dataflow cannot state, because the node that
+    sends them throttles internally (the MuJoCo node renders its cameras at
+    30 Hz while answering state requests at the leader tick).
     """
     if not raw:
         return {}
-    declared = yaml.safe_load(raw)
-    if not isinstance(declared, dict):
-        raise ValueError(f"FREQUENCIES must be a map of group or path to Hz: {raw!r}")
-    frequencies = {}
-    for key, value in declared.items():
-        if not _known_frequency_key(key):
-            raise ValueError(
-                f"FREQUENCIES has an unknown key: {key!r}. Use a group "
-                f"({', '.join(DEFAULT_FREQUENCIES)}) or a data path."
-            )
+    frequencies = yaml.safe_load(raw)
+    if not isinstance(frequencies, dict):
+        raise ValueError(f"FREQUENCIES must be a map of input name to Hz: {raw!r}")
+    for name, value in frequencies.items():
         if not isinstance(value, (int, float)) or value <= 0:
-            raise ValueError(
-                f"FREQUENCIES[{key!r}] must be a positive number: {value!r}"
-            )
-        frequencies[key] = float(value)
-    return frequencies
+            raise ValueError(f"FREQUENCIES[{name!r}] must be positive: {value!r}")
+    return {name: float(value) for name, value in frequencies.items()}
 
 
-def resolve_frequencies(inputs, declared=None):
-    """Return ``{data path: {"nominal_hz": hz, "source": str}}`` for inputs.
+def detect_frequencies(inputs, configs, overrides=None):
+    """Return the frequencies of the recorder's inputs, in the dataset shape.
 
-    ``inputs`` is the recorder's own ``inputs`` section; inputs that are not
-    recorded as data are skipped. A stream's rate comes from its data path if
-    declared, otherwise from its group, otherwise from the defaults.
+    ``action.arms.<side>`` / ``obs.arms.<side>`` / ``action.lifter`` /
+    ``obs.lifter`` / ``cameras.<name>``, in Hz. An input whose rate is neither
+    detected nor overridden is left out, and reported in ``unknown``.
     """
-    declared = declared or {}
-    frequencies = {}
+    detector = FrequencyDetector(configs)
+    frequencies = {"action": {"arms": {}}, "obs": {"arms": {}}, "cameras": {}}
+    overrides = overrides or {}
+    unknown = []
     for name in inputs:
-        path = data_path(name)
-        if path is None:
+        if name in overrides:
+            frequency = overrides[name]
+        else:
+            frequency = detector.detect(inputs[name])
+        if name.startswith("arm_"):
+            # arm_right_action -> right, action
+            side, type = name.split("_")[1:3]
+            slot, key = frequencies[TYPES[type]]["arms"], side
+        elif name.startswith("elevation_"):
+            # elevation_action -> action, lifter
+            type = name.removeprefix("elevation_")
+            slot, key = frequencies[TYPES[type]], "lifter"
+        elif name.startswith("camera_"):
+            # camera_wrist_right -> wrist_right
+            slot, key = frequencies["cameras"], name.removeprefix("camera_")
+        else:
             continue
-        group = frequency_group(path)
-        if path in declared:
-            frequencies[path] = {"nominal_hz": declared[path], "source": "declared"}
-        elif group in declared:
-            frequencies[path] = {
-                "nominal_hz": declared[group],
-                "source": f"declared {group}",
-            }
-        else:
-            frequencies[path] = {
-                "nominal_hz": DEFAULT_FREQUENCIES[group],
-                "source": f"default {group}",
-            }
-    return frequencies
+        if frequency is None:
+            unknown.append(name)
+            continue
+        slot[key] = round(frequency, 3)
+    return frequencies, unknown
 
 
-def legacy_frequencies(frequencies):
-    """Return frequencies in the nested shape of dataset format 0.4.0.
-
-    ``action/arms/right`` -> ``action.arms.right``,
-    ``obs/lifter/elevation`` -> ``obs.lifter``,
-    ``cameras/head_left`` -> ``cameras.head_left``.
-    """
-    legacy = {"action": {"arms": {}}, "obs": {"arms": {}}, "cameras": {}}
-    for path, frequency in frequencies.items():
-        hz = frequency["nominal_hz"]
-        if path.startswith("cameras/"):
-            legacy["cameras"][path.removeprefix("cameras/")] = hz
-        else:
-            type, embodiment, component = path.split("/")
-            if embodiment == "arms":
-                legacy[type]["arms"][component] = hz
-            else:
-                legacy[type][embodiment] = hz
-    return legacy
+TYPES = {"action": "action", "observation": "obs"}
 
 
 def _collect_dynamic_metadata(metadata, args, node):
-    """Fill in the metadata that only the running dataflow knows.
-
-    Returns the frequencies keyed by data path; ``metadata`` gets the nested
-    0.4.0 shape so that existing readers keep working.
-    """
     metadata["operation_type"] = args.operation_type
     if args.operation_type == "teleop":
         if "equipment" not in metadata:
@@ -393,17 +380,18 @@ def _collect_dynamic_metadata(metadata, args, node):
         if args.docker_image:
             metadata["model"]["docker_image"] = args.docker_image
 
-    frequencies = resolve_frequencies(
+    frequencies, unknown = detect_frequencies(
         node.node_config()["inputs"],
+        node.dataflow_descriptor()["nodes"],
         parse_frequencies(args.frequencies),
     )
-    for path, frequency in sorted(frequencies.items()):
+    for name in unknown:
         print(
-            f"{path}: {frequency['nominal_hz']} Hz ({frequency['source']})",
+            f"Warning: no frequency for {name}: no tick above it. Wire a tick "
+            "to the node that sends it, or set FREQUENCIES.",
             file=sys.stderr,
         )
-    metadata["frequencies"] = legacy_frequencies(frequencies)
-    return frequencies
+    metadata["frequencies"] = frequencies
 
 
 def main():
