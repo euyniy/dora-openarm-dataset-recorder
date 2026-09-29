@@ -28,6 +28,7 @@ import numpy as np
 import math
 from numpy.typing import ArrayLike
 import shutil
+import sys
 import yaml
 
 
@@ -250,42 +251,134 @@ class DatasetWriter:
         return existing_metadata
 
 
-class FrequencyDetector:
-    """Detect frequency of an input."""
+def data_path(input_name):
+    """Return the dataset path a recorder input is stored under.
 
-    def __init__(self, configs):
-        """Initialize with node configurations."""
-        self._configs = configs
+    ``arm_right_action`` -> ``action/arms/right``,
+    ``elevation_observation`` -> ``obs/lifter/elevation``,
+    ``camera_head_left`` -> ``cameras/head_left``.
+    Returns ``None`` for inputs that are not recorded as data.
+    """
+    if input_name.startswith("arm_"):
+        side, type = input_name.split("_")[1:3]
+        return f"{TYPE_PATHS[type]}/arms/{side}"
+    elif input_name.startswith("elevation_"):
+        type = input_name.removeprefix("elevation_")
+        return f"{TYPE_PATHS[type]}/lifter/elevation"
+    elif input_name.startswith("camera_"):
+        return f"cameras/{input_name.removeprefix('camera_')}"
+    return None
 
-    def detect(self, input):
-        """Detect frequency of the given input."""
-        if isinstance(input, dict):
-            input = input["source"]
-        node_id, name = input.split("/", 1)
-        for config in self._configs:
-            if config["id"] != node_id:
-                continue
-            inputs = config["inputs"]
-            next_input = (
-                inputs.get("tick")
-                or inputs.get("request_state")
-                or inputs.get("request_position")
+
+TYPE_PATHS = {"action": "action", "observation": "obs"}
+
+# The rates the cell runs at: the arms and the lifter follow the leader tick,
+# the cameras follow the camera tick. These are nominal rates, i.e. what the
+# dataflow asks for -- what a camera actually delivered is in its image
+# timestamps, and measuring that is left to the dataset tools.
+#
+# They are declared rather than derived from the dataflow. Walking the graph
+# upstream to find the timer behind each stream reconstructs, unreliably, a
+# fact that fits on one line: it broke on every node whose input names it did
+# not know (splitters, IK), and it turned 33 ms into 30.303030303030305.
+DEFAULT_FREQUENCIES = {"arms": 250.0, "lifter": 250.0, "cameras": 30.0}
+
+
+def frequency_group(path):
+    """Return the group of a data path: ``arms``, ``lifter`` or ``cameras``."""
+    if path.startswith("cameras/"):
+        return "cameras"
+    return path.split("/")[1]
+
+
+def _known_frequency_key(key):
+    if key in DEFAULT_FREQUENCIES:
+        return True
+    return "/" in key and frequency_group(key) in DEFAULT_FREQUENCIES
+
+
+def parse_frequencies(raw):
+    """Parse the ``FREQUENCIES`` setting into ``{group or data path: Hz}``.
+
+    A group covers every stream in it (``arms: 500``), a data path covers one
+    stream (``cameras/ceiling: 15``).
+    """
+    if not raw:
+        return {}
+    declared = yaml.safe_load(raw)
+    if not isinstance(declared, dict):
+        raise ValueError(f"FREQUENCIES must be a map of group or path to Hz: {raw!r}")
+    frequencies = {}
+    for key, value in declared.items():
+        if not _known_frequency_key(key):
+            raise ValueError(
+                f"FREQUENCIES has an unknown key: {key!r}. Use a group "
+                f"({', '.join(DEFAULT_FREQUENCIES)}) or a data path."
             )
-            if next_input is None:
-                continue
-            if next_input.startswith("dora/timer/"):
-                unit, value = next_input.split("/")[2:4]
-                if unit == "secs":
-                    return 1.0 / int(value)
-                elif unit == "millis":
-                    return 1_000.0 / int(value)
-                else:
-                    return None
+        if not isinstance(value, (int, float)) or value <= 0:
+            raise ValueError(
+                f"FREQUENCIES[{key!r}] must be a positive number: {value!r}"
+            )
+        frequencies[key] = float(value)
+    return frequencies
+
+
+def resolve_frequencies(inputs, declared=None):
+    """Return ``{data path: {"nominal_hz": hz, "source": str}}`` for inputs.
+
+    ``inputs`` is the recorder's own ``inputs`` section; inputs that are not
+    recorded as data are skipped. A stream's rate comes from its data path if
+    declared, otherwise from its group, otherwise from the defaults.
+    """
+    declared = declared or {}
+    frequencies = {}
+    for name in inputs:
+        path = data_path(name)
+        if path is None:
+            continue
+        group = frequency_group(path)
+        if path in declared:
+            frequencies[path] = {"nominal_hz": declared[path], "source": "declared"}
+        elif group in declared:
+            frequencies[path] = {
+                "nominal_hz": declared[group],
+                "source": f"declared {group}",
+            }
+        else:
+            frequencies[path] = {
+                "nominal_hz": DEFAULT_FREQUENCIES[group],
+                "source": f"default {group}",
+            }
+    return frequencies
+
+
+def legacy_frequencies(frequencies):
+    """Return frequencies in the nested shape of dataset format 0.4.0.
+
+    ``action/arms/right`` -> ``action.arms.right``,
+    ``obs/lifter/elevation`` -> ``obs.lifter``,
+    ``cameras/head_left`` -> ``cameras.head_left``.
+    """
+    legacy = {"action": {"arms": {}}, "obs": {"arms": {}}, "cameras": {}}
+    for path, frequency in frequencies.items():
+        hz = frequency["nominal_hz"]
+        if path.startswith("cameras/"):
+            legacy["cameras"][path.removeprefix("cameras/")] = hz
+        else:
+            type, embodiment, component = path.split("/")
+            if embodiment == "arms":
+                legacy[type]["arms"][component] = hz
             else:
-                return self.detect(next_input)
+                legacy[type][embodiment] = hz
+    return legacy
 
 
 def _collect_dynamic_metadata(metadata, args, node):
+    """Fill in the metadata that only the running dataflow knows.
+
+    Returns the frequencies keyed by data path; ``metadata`` gets the nested
+    0.4.0 shape so that existing readers keep working.
+    """
     metadata["operation_type"] = args.operation_type
     if args.operation_type == "teleop":
         if "equipment" not in metadata:
@@ -300,30 +393,17 @@ def _collect_dynamic_metadata(metadata, args, node):
         if args.docker_image:
             metadata["model"]["docker_image"] = args.docker_image
 
-    metadata["frequencies"] = {
-        "action": {
-            "arms": {},
-        },
-        "obs": {
-            "arms": {},
-        },
-        "cameras": {},
-    }
-    frequency_detector = FrequencyDetector(node.dataflow_descriptor()["nodes"])
-    for name, input in node.node_config()["inputs"].items():
-        frequency = frequency_detector.detect(input)
-        if not frequency:
-            continue
-        if name.startswith("arm_"):
-            # arm_right_action -> right, action
-            side, type = name.split("_")[1:3]
-            if type == "observation":
-                type = "obs"
-            metadata["frequencies"][type]["arms"][side] = frequency
-        elif name.startswith("camera_"):
-            # camera_wrist_right -> wrist_right
-            camera_name = name.removeprefix("camera_")
-            metadata["frequencies"]["cameras"][camera_name] = frequency
+    frequencies = resolve_frequencies(
+        node.node_config()["inputs"],
+        parse_frequencies(args.frequencies),
+    )
+    for path, frequency in sorted(frequencies.items()):
+        print(
+            f"{path}: {frequency['nominal_hz']} Hz ({frequency['source']})",
+            file=sys.stderr,
+        )
+    metadata["frequencies"] = legacy_frequencies(frequencies)
+    return frequencies
 
 
 def main():
@@ -339,6 +419,13 @@ def main():
         "--docker-image",
         default=os.getenv("DOCKER_IMAGE", os.getenv("IMAGE")),
         help="The Docker image used for this rollout",
+        type=str,
+    )
+    parser.add_argument(
+        "--frequencies",
+        default=os.getenv("FREQUENCIES"),
+        help="YAML map of data path to frequency in Hz, for streams the "
+        'dataflow cannot be walked for (e.g. "cameras/ceiling: 30")',
         type=str,
     )
     parser.add_argument(
